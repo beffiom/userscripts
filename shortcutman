@@ -1,6 +1,6 @@
 #!/bin/sh
 
-shortcuts=$HOME/.config/misc/shortcuts
+shortcuts=$HOME/.config/userscripts/static/shortcuts
 bashrc=$HOME/.bashrc
 bash_shortcuts=$HOME/.config/bash/shortcutrc
 yazi_shortcuts=/tmp/shortcut.toml

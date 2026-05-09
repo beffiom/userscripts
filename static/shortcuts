@@ -1,0 +1,16 @@
+home                gh      $HOME
+root                gr      /
+documents           gdo     $HOME/documents
+downloads           gdl     $HOME/downloads
+notes               gn      $HOME/documents/notes
+external-drives     ge      /run/media/$USER
+audio               ga      $HOME/media/audio
+video               gv      $HOME/media/video
+youtube             gy      $HOME/media/video/youtube
+music               gm      $HOME/media/audio/music
+photos              gp      $HOME/media/photos
+wallpaper           gw      $HOME/media/photos/wallpapers
+books               gb      $HOME/media/books
+userscripts         gs      $HOME/.config/userscripts
+config              gc      $HOME/.config
+homelab             gl      /run/media/$USER/MEDIA/media/homelab

@@ -6,7 +6,7 @@ CLIPBOARD="wl-copy"
 NOTIFICATION="dunstify"
 MENU="rofi -dmenu"
 FUZZY="fzf"
-MARKS_FILE="/home/$USER/.config/misc/marks.txt"
+MARKS_FILE="$HOME/.config/userscripts/static/marks.txt"
 
 usage() {
     cat >&2 <<EOF
