@@ -1,5 +1,5 @@
 #!/bin/sh
-choice="$(printf "screenshot area\\nscreenshot window\\nscreenshot output\\nscreenshot area (copy)\\nscreenshot window (copy)\\nscreenshot output (copy)" | ~/.config/userscripts/dmenu/dmenu)"
+choice="$(printf "screenshot area\\nscreenshot window\\nscreenshot output\\nscreenshot area (copy)\\nscreenshot window (copy)\\nscreenshot output (copy)" | rofi -dmenu)"
 
 case "$choice" in
     "screenshot area") grim -g "$(slurp)" ~/media/photos/screenshots/screenshot-$(date '+%Y%m%d-%H%M%S').png ;;
@@ -9,5 +9,4 @@ case "$choice" in
     "screenshot window (copy)") grim -l "$(hyprctl activewindow -j | jq -r '.at[] | @csv' | sed 's/,/ /g')" - | wl-copy ;;
     "screenshot output (copy)") grim - | wl-copy ;;
 esac
-notify-send "Screenshot taken"
-
+if [ $? -eq 0 ]; then notify-send "Screenshot taken"; fi
