@@ -1,0 +1,403 @@
+#!/usr/bin/env bash
+# merge-subs
+#
+# For each video in the current directory:
+#   1. Finds all matching subtitle files (film.srt, film.en.srt, film.fr.srt, etc.)
+#   2. Attempts to sync each subtitle with alass:
+#      - Unsupported formats (smi, vtt): skip sync, mux as-is
+#      - Encoding issues: convert to UTF-8 first, then sync
+#      - Parse errors: mux original as-is with a warning
+#   3. Muxes the video + all subtitles into a single .mkv with language metadata
+#   4. Runs an integrity check on the output .mkv
+#   5. Deletes originals on success (or moves to ./backup/ with -b)
+#
+# Usage:
+#   ./merge-subs [OPTIONS]
+#
+# Options:
+#   -r, --recursive      Scan subdirectories recursively
+#   -b, --backup         Move originals to ./backup/ instead of deleting them
+#   -n, --dry-run        Show what would be done without doing it
+#   -h, --help           Show this help message
+#
+# Requirements:
+#   alass   — https://github.com/kaegi/alass/releases  |  cargo install alass-cli
+#   ffmpeg  — https://ffmpeg.org/download.html
+#   iconv   — usually pre-installed on Linux/macOS
+#   uchardet (optional, improves encoding detection) — apt install uchardet
+
+set -euo pipefail
+
+# ── Colours ──────────────────────────────────────────────────────────────────
+RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
+CYAN='\033[0;36m'; BOLD='\033[1m'; RESET='\033[0m'
+
+# ── Defaults ─────────────────────────────────────────────────────────────────
+RECURSIVE=false
+BACKUP=false
+DRY_RUN=false
+SCAN_DIR="."
+DEFAULT_LANG="eng"
+
+VIDEO_EXTS=("mp4" "mkv" "avi" "mov" "wmv" "flv" "webm" "m4v" "ts" "mpg" "mpeg")
+SUB_EXTS=("srt" "ass" "vtt" "smi")
+
+# Formats alass can actually parse
+ALASS_SUPPORTED_EXTS=("srt" "ass" "ssa" "idx")
+
+# ── ISO 639-1 → ISO 639-2 mapping ────────────────────────────────────────────
+declare -A LANG_MAP=(
+  [en]="eng" [fr]="fra" [de]="deu" [es]="spa" [it]="ita"
+  [pt]="por" [nl]="nld" [pl]="pol" [ru]="rus" [ja]="jpn"
+  [ko]="kor" [zh]="zho" [ar]="ara" [sv]="swe" [no]="nor"
+  [da]="dan" [fi]="fin" [cs]="ces" [hu]="hun" [ro]="ron"
+  [tr]="tur" [he]="heb" [hi]="hin" [th]="tha" [vi]="vie"
+  [id]="ind" [uk]="ukr" [el]="ell" [bg]="bul" [hr]="hrv"
+  [sk]="slk" [lt]="lit" [lv]="lav" [et]="est" [sl]="slv"
+  [eng]="eng" [fra]="fra" [deu]="deu" [spa]="spa" [ita]="ita"
+  [por]="por" [nld]="nld" [pol]="pol" [rus]="rus" [jpn]="jpn"
+  [kor]="kor" [zho]="zho" [ara]="ara" [swe]="swe" [nor]="nor"
+  [dan]="dan" [fin]="fin" [ces]="ces" [hun]="hun" [ron]="ron"
+  [tur]="tur" [heb]="heb" [hin]="hin" [tha]="tha" [vie]="vie"
+)
+
+declare -A LANG_NAME=(
+  [eng]="English" [fra]="French" [deu]="German" [spa]="Spanish" [ita]="Italian"
+  [por]="Portuguese" [nld]="Dutch" [pol]="Polish" [rus]="Russian" [jpn]="Japanese"
+  [kor]="Korean" [zho]="Chinese" [ara]="Arabic" [swe]="Swedish" [nor]="Norwegian"
+  [dan]="Danish" [fin]="Finnish" [ces]="Czech" [hun]="Hungarian" [ron]="Romanian"
+  [tur]="Turkish" [heb]="Hebrew" [hin]="Hindi" [tha]="Thai" [vie]="Vietnamese"
+  [ind]="Indonesian" [ukr]="Ukrainian" [ell]="Greek" [bul]="Bulgarian" [hrv]="Croatian"
+  [slk]="Slovak" [lit]="Lithuanian" [lav]="Latvian" [est]="Estonian" [slv]="Slovenian"
+)
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+usage() { sed -n 's/^# \?//p' "$0" | head -34; exit 0; }
+log()     { echo -e "${CYAN}[INFO]${RESET}  $*"; }
+success() { echo -e "${GREEN}[OK]${RESET}    $*"; }
+warn()    { echo -e "${YELLOW}[WARN]${RESET}  $*"; }
+error()   { echo -e "${RED}[ERROR]${RESET} $*" >&2; }
+
+check_deps() {
+  local missing=()
+  for cmd in alass ffmpeg ffprobe iconv; do
+    command -v "$cmd" &>/dev/null || missing+=("$cmd")
+  done
+  if [[ ${#missing[@]} -gt 0 ]]; then
+    error "Missing required tools: ${missing[*]}"
+    echo ""
+    [[ " ${missing[*]} " =~ " alass " ]]   && echo "  alass  : https://github.com/kaegi/alass/releases  |  cargo install alass-cli"
+    [[ " ${missing[*]} " =~ " ffmpeg " ]]  && echo "  ffmpeg : https://ffmpeg.org/download.html"
+    [[ " ${missing[*]} " =~ " iconv " ]]   && echo "  iconv  : usually pre-installed; try apt install libc-bin"
+    exit 1
+  fi
+  # Optional
+  command -v uchardet &>/dev/null && HAS_UCHARDET=true || HAS_UCHARDET=false
+  command -v file     &>/dev/null && HAS_FILE=true     || HAS_FILE=false
+}
+
+resolve_lang() {
+  local code="${1,,}"
+  echo "${LANG_MAP[$code]:-$DEFAULT_LANG}"
+}
+
+find_subtitles() {
+  local dir="$1" base="$2"
+  local results=()
+  for f in "$dir/$base".*; do
+    [[ -e "$f" ]] || continue
+    local ext ext_lower is_video
+    ext="${f##*.}"; ext_lower="${ext,,}"
+    is_video=false
+    for ve in "${VIDEO_EXTS[@]}"; do [[ "$ext_lower" == "$ve" ]] && { is_video=true; break; }; done
+    $is_video && continue
+    for se in "${SUB_EXTS[@]}"; do
+      if [[ "$ext_lower" == "$se" ]]; then results+=("$f"); break; fi
+    done
+  done
+  [[ ${#results[@]} -gt 0 ]] && printf '%s\n' "${results[@]}"
+}
+
+parse_lang_from_filename() {
+  local base="$1" subfile="$2" subname remainder
+  subname="$(basename "${subfile%.*}")"
+  remainder="${subname#"$base"}"; remainder="${remainder#.}"
+  echo "$remainder"
+}
+
+# Returns true if alass supports this subtitle extension
+alass_supports_ext() {
+  local ext="${1,,}"
+  for e in "${ALASS_SUPPORTED_EXTS[@]}"; do [[ "$ext" == "$e" ]] && return 0; done
+  return 1
+}
+
+# Detect encoding of a file; returns charset string
+detect_encoding() {
+  local file="$1"
+  local enc=""
+  if $HAS_UCHARDET; then
+    enc="$(uchardet "$file" 2>/dev/null | tr '[:lower:]' '[:upper:]')"
+  elif $HAS_FILE; then
+    enc="$(file -bi "$file" 2>/dev/null | sed 's/.*charset=//' | tr '[:lower:]' '[:upper:]')"
+  fi
+  # Normalise common aliases
+  case "$enc" in
+    UTF-8|UTF8)                   echo "UTF-8" ;;
+    UTF-16|UTF-16LE|UTF-16BE)     echo "$enc" ;;
+    WINDOWS-1252|CP1252|LATIN-1|ISO-8859-1|ISO_8859-1) echo "WINDOWS-1252" ;;
+    WINDOWS-1250|CP1250)          echo "WINDOWS-1250" ;;
+    WINDOWS-1251|CP1251)          echo "WINDOWS-1251" ;;
+    *)                            echo "WINDOWS-1252" ;;   # safe fallback for Latin scripts
+  esac
+}
+
+# Convert a subtitle file to UTF-8 in-place (tmpdir), return path to converted file
+convert_to_utf8() {
+  local src="$1" tmpdir="$2"
+  local fname; fname="$(basename "$src")"
+  local dest="$tmpdir/utf8_${fname}"
+  local enc; enc="$(detect_encoding "$src")"
+
+  if [[ "$enc" == "UTF-8" ]]; then
+    cp "$src" "$dest"
+  else
+    log "Converting $fname from $enc → UTF-8"
+    if ! iconv -f "$enc" -t "UTF-8" "$src" > "$dest" 2>/dev/null; then
+      # Try with //TRANSLIT as a fallback for problem chars
+      iconv -f "$enc" -t "UTF-8//TRANSLIT" "$src" > "$dest" 2>/dev/null \
+        || { warn "iconv failed for $fname, using original"; cp "$src" "$dest"; }
+    fi
+  fi
+  echo "$dest"
+}
+
+# ── Argument parsing ──────────────────────────────────────────────────────────
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -r|--recursive) RECURSIVE=true ;;
+    -b|--backup)    BACKUP=true ;;
+    -n|--dry-run)   DRY_RUN=true ;;
+    -h|--help)      usage ;;
+    -*) error "Unknown option: $1"; exit 1 ;;
+  esac
+  shift
+done
+
+# ── Pre-flight ────────────────────────────────────────────────────────────────
+check_deps
+
+BACKUP_DIR="$(pwd)/backup"
+
+echo -e "${BOLD}Subtitle Sync & Merge${RESET}"
+echo -e "  Scan dir : $(pwd)"
+echo -e "  Recursive: $RECURSIVE"
+echo -e "  Backup   : $BACKUP${BACKUP:+ → ./backup/}"
+echo -e "  Dry run  : $DRY_RUN"
+$HAS_UCHARDET && echo -e "  Encoding : uchardet (auto-detect)" \
+              || echo -e "  Encoding : ${HAS_FILE:+file (basic detect)}${HAS_FILE:-fallback WINDOWS-1252}"
+echo ""
+
+if $BACKUP && ! $DRY_RUN; then
+  mkdir -p "$BACKUP_DIR"
+fi
+
+# ── Build list of video files ─────────────────────────────────────────────────
+mapfile -t VIDEO_FILES < <(
+  if $RECURSIVE; then find "$SCAN_DIR" -type f
+  else find "$SCAN_DIR" -maxdepth 1 -type f; fi \
+  | sort | while IFS= read -r f; do
+    ext="${f##*.}"; ext_lower="${ext,,}"
+    for ve in "${VIDEO_EXTS[@]}"; do [[ "$ext_lower" == "$ve" ]] && { echo "$f"; break; }; done
+  done
+)
+
+if [[ ${#VIDEO_FILES[@]} -eq 0 ]]; then
+  warn "No video files found in $(pwd)"
+  exit 0
+fi
+
+# ── Main loop ─────────────────────────────────────────────────────────────────
+total=0; succeeded=0; failed=0; skipped=0
+TMPDIR_BASE="$(mktemp -d)"
+trap 'rm -rf "$TMPDIR_BASE"' EXIT
+
+for video in "${VIDEO_FILES[@]}"; do
+  video_dir="$(realpath "$(dirname "$video")")"
+  video_filename="$(basename "$video")"
+  video_base="${video_filename%.*}"
+  video_abs="$(realpath "$video")"
+
+  mapfile -t subs < <(find_subtitles "$video_dir" "$video_base" || true)
+
+  if [[ ${#subs[@]} -eq 0 ]]; then
+    warn "No subtitles found for: $video_filename — skipping"
+    ((skipped++)) || true
+    continue
+  fi
+
+  ((total++)) || true
+  out_mkv="${video_dir}/${video_base}.mkv"
+
+  echo -e "${BOLD}▶ $video_filename${RESET}"
+  log "Found ${#subs[@]} subtitle(s):"
+  for s in "${subs[@]}"; do echo "    $(basename "$s")"; done
+
+  if $DRY_RUN; then
+    echo -e "  ${YELLOW}[DRY-RUN]${RESET} Would sync + mux into $(basename "$out_mkv")"
+    $BACKUP && echo -e "  ${YELLOW}[DRY-RUN]${RESET} Would move originals → ./backup/" \
+            || echo -e "  ${YELLOW}[DRY-RUN]${RESET} Would delete originals"
+    echo ""; ((succeeded++)) || true; continue
+  fi
+
+  tmpdir="$TMPDIR_BASE/$video_base"
+  mkdir -p "$tmpdir"
+
+  # ── Step 1: sync subtitles ────────────────────────────────────────────────
+  # subs_for_mux holds the actual file paths ffmpeg will read (synced or original)
+  declare -a subs_for_mux=()
+  abort=false
+
+  for sub in "${subs[@]}"; do
+    [[ -z "$sub" || ! -f "$sub" ]] && continue
+    sub_abs="$(realpath "$sub")"
+    sub_filename="$(basename "$sub")"
+    sub_ext="${sub_filename##*.}"
+    sub_ext_lower="${sub_ext,,}"
+
+    # Convert unsupported formats (smi, vtt) to srt for both alass and ffmpeg
+    if [[ "$sub_ext_lower" == "smi" || "$sub_ext_lower" == "vtt" ]]; then
+      converted_srt="$tmpdir/${sub_filename%.*}.srt"
+      log "Converting $sub_filename → .srt"
+      if ffmpeg -hide_banner -loglevel warning -y -i "$sub_abs" "$converted_srt" 2>/dev/null; then
+        sub_abs="$converted_srt"
+        sub_ext="srt"; sub_ext_lower="srt"
+        sub_filename="${sub_filename%.*}.srt"
+        log "Converted: $sub_filename"
+      else
+        warn "Could not convert $sub_filename — skipping"
+        continue
+      fi
+    fi
+
+    if ! alass_supports_ext "$sub_ext_lower"; then
+      warn "Skipping sync for $sub_filename (format .$sub_ext_lower not supported by alass) — will mux as-is"
+      subs_for_mux+=("$sub_abs")
+      continue
+    fi
+
+    # Convert to UTF-8 first (handles charset errors)
+    converted="$(convert_to_utf8 "$sub_abs" "$tmpdir")"
+    synced_out="$tmpdir/${sub_filename%.*}.synced.${sub_ext}"
+
+    log "Syncing : $sub_filename"
+    alass_ok=true
+    alass "$video_abs" "$converted" "$synced_out" 2>&1 | grep -v "^$" | sed "s/^/    /" || alass_ok=false
+
+    if $alass_ok && [[ -s "$synced_out" ]]; then
+      # Overwrite the original with the synced UTF-8 version
+      cp "$synced_out" "$sub_abs"
+      log "Updated : $sub_filename (synced)"
+      subs_for_mux+=("$sub_abs")
+    else
+      warn "alass could not sync $sub_filename — will mux original as-is"
+      subs_for_mux+=("$sub_abs")
+    fi
+  done
+
+  if $abort; then
+    ((failed++)) || true; echo ""; continue
+  fi
+
+  # ── Step 2: mux video + subtitles → .mkv ─────────────────────────────────
+  declare -a sub_input_args=() map_args=() metadata_args=()
+  sub_input_idx=1; track_idx=0
+
+  for i in "${!subs_for_mux[@]}"; do
+    sub="${subs_for_mux[$i]}"
+    orig_sub="${subs[$i]}"   # use original filename for language parsing
+    sub_filename="$(basename "$orig_sub")"
+    lang_code="$(parse_lang_from_filename "$video_base" "$orig_sub")"
+    iso_lang="$(resolve_lang "${lang_code:-}")"
+    lang_label="${LANG_NAME[$iso_lang]:-$iso_lang}"
+
+    log "Track $((track_idx+1)): $sub_filename → $iso_lang ($lang_label)"
+    sub_input_args+=(-i "$sub")
+    map_args+=(-map "$sub_input_idx")
+    metadata_args+=(
+      "-metadata:s:s:${track_idx}" "language=${iso_lang}"
+      "-metadata:s:s:${track_idx}" "title=${lang_label}"
+    )
+    ((sub_input_idx++)) || true; ((track_idx++)) || true
+  done
+
+  # Use temp output if input video is already an .mkv (would clobber itself)
+  tmp_out=""
+  final_out="$out_mkv"
+  video_ext_lower="${video_filename##*.}"; video_ext_lower="${video_ext_lower,,}"
+  if [[ "$video_ext_lower" == "mkv" ]]; then
+    tmp_out="$tmpdir/${video_base}.tmp.mkv"
+    final_out="$tmp_out"
+  fi
+
+  log "Muxing  → $(basename "$out_mkv")"
+  mux_ok=true
+  ffmpeg -hide_banner -loglevel warning \
+    -y -i "$video_abs" \
+    "${sub_input_args[@]}" \
+    -map 0 \
+    "${map_args[@]}" \
+    -c copy \
+    "${metadata_args[@]}" \
+    "$final_out" 2>&1 | sed "s/^/    /" || mux_ok=false
+
+  if ! $mux_ok; then
+    error "ffmpeg muxing failed for: $video_filename"
+    [[ -n "$tmp_out" && -f "$tmp_out" ]] && rm -f "$tmp_out"
+    ((failed++)) || true; echo ""; continue
+  fi
+
+  [[ -n "$tmp_out" ]] && mv "$tmp_out" "$out_mkv"
+
+  # ── Step 3: integrity check ───────────────────────────────────────────────
+  if [[ ! -s "$out_mkv" ]]; then
+    error "Output file is empty — keeping originals"
+    ((failed++)) || true; echo ""; continue
+  fi
+  if ! ffprobe -v error -i "$out_mkv" > /dev/null 2>&1; then
+    error "Output failed integrity check — keeping originals"
+    ((failed++)) || true; echo ""; continue
+  fi
+
+  success "Created  → $(basename "$out_mkv")"
+
+  # ── Step 4: remove or backup originals ───────────────────────────────────
+  declare -a originals=()
+  [[ "$video_abs" != "$out_mkv" ]] && originals+=("$video_abs")
+  for sub in "${subs[@]}"; do [[ -z "$sub" || ! -f "$sub" ]] && continue; originals+=("$(realpath "$sub")"); done
+
+  if $BACKUP; then
+    for f in "${originals[@]}"; do
+      mv "$f" "$BACKUP_DIR/"
+      log "Backed up: $(basename "$f") → backup/"
+    done
+  else
+    for f in "${originals[@]}"; do
+      rm -f "$f"
+      log "Deleted  : $(basename "$f")"
+    done
+  fi
+
+  ((succeeded++)) || true
+  unset sub_input_args map_args metadata_args originals subs_for_mux
+  declare -a sub_input_args=() map_args=() metadata_args=() originals=() subs_for_mux=()
+  echo ""
+done
+
+# ── Summary ───────────────────────────────────────────────────────────────────
+echo -e "${BOLD}── Summary ──────────────────────────────${RESET}"
+echo -e "  Processed : $total"
+echo -e "  ${GREEN}Succeeded : $succeeded${RESET}"
+[[ $skipped -gt 0 ]] && echo -e "  ${YELLOW}Skipped   : $skipped (no subtitles found)${RESET}"
+[[ $failed  -gt 0 ]] && echo -e "  ${RED}Failed    : $failed${RESET}"
+echo ""

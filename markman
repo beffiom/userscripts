@@ -1,0 +1,84 @@
+#!/bin/env bash
+
+set -euo pipefail  # Exit on error, unset vars, pipe fails
+
+CLIPBOARD="wl-copy"
+NOTIFICATION="dunstify"
+MENU="rofi -dmenu"
+FUZZY="fzf"
+MARKS_FILE="/home/$USER/.config/misc/marks.txt"
+
+usage() {
+    cat >&2 <<EOF
+markman
+-------
+retrieve, add, or remove bookmarks using a plain text file
+
+Usage: markman [-m]
+    -m Use dmenu instead of fzf
+    -a Add bookmark
+    -r Remove bookmark
+    -h Show this usage page
+EOF
+}
+select_mark() {
+    local selector="$1"
+    local selected_url=$(awk -F '::' '{print $2,"#"$1}' $MARKS_FILE | $selector | awk '{print $1}')
+    [[ -n "$selected_url" ]] && echo "$selected_url" | wl-copy && dunstify "URL Copied to Clipboard" "$selected_url" -u low
+    exit 0
+}
+add_mark() {
+    local selector="$1"
+    local category=$(awk -F '::' '{print $1}' files/marks.txt | uniq | $selector)
+    [[ "$selector" == "$FUZZY" ]] && {
+        echo "Enter URL: "
+        read -r url
+    }
+    url_regex='^https?://[^/[:space:]]+\.[^/[:space:]]+.*$'
+    [[ $url =~ $url_regex ]] || {
+        dunstify "Invalid URL" -u low
+        exit 1
+    }
+    clean_url="${url#http://}"
+    clean_url="${clean_url#https://}"
+    clean_url="${clean_url#www.}"
+    echo "$category::$clean_url" \
+        | tee -a $MARKS_FILE \
+        && sort $MARKS_FILE -o $MARKS_FILE \
+        && { dunstify "URL Added" "$clean_url\ncategory: $category"; exit 0;}
+    exit 1
+}
+remove_mark() {
+    local selector="$1"
+    local selected_url=$(awk -F '::' '{print $2}' "$MARKS_FILE" | $selector)
+    [[ -n "$selected_url" ]] && sed -i.bak "\|::$selected_url$|d" "$MARKS_FILE" && dunstify "Bookmark Removed" "$selected_url" -u low
+    exit 0
+}
+main() {
+    local selector="$FUZZY" add=0 remove=0
+    # Parse options
+    while getopts "marh" opt; do
+      case $opt in
+        m) selector=$MENU ;;
+        a) add=1 ;;
+        r) remove=1 ;;
+        h) usage; exit 0 ;;
+        ?) usage >&2; exit 1 ;;
+      esac
+    done
+    shift $((OPTIND-1))
+
+    [[ -f $MARKS_FILE ]] || {
+        echo "Bookmark file located at $MARKS_FILE invalid or does not exist."
+        exit 1
+    }
+    (( add && remove )) && {
+        echo "Incorrect usage: -a and -r cannot be used together"
+        exit 1
+    }
+    (( add )) && add_mark "$selector"
+    (( remove )) && remove_mark "$selector"
+    select_mark "$selector"
+}
+
+main "$@"

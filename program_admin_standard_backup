@@ -1,0 +1,34 @@
+#!/bin/sh
+
+backup_drive=$1
+
+if [ -z "$backup_drive" ]; then
+	echo "Error:"
+	echo "Location of drive you want to backup to must be provided."
+	exit
+fi
+
+if [ ! -d "$backup_drive" ]; then
+	echo "Directory does not exist."
+	exit
+fi
+
+if [ ! command -v rsync &> /dev/null ]; then
+	echo "rsync not installed. Please install and try again."
+	echo "------------------------------"
+	echo "Fedora: sudo dnf install rsync"
+	echo "Ubuntu: sudo apt-get install rsync"
+	echo "Arch: sudo pacman -S rsync"
+	echo "Mac: sudo brew install rsync"
+	exit
+fi
+
+sudo rsync -ra --no-owner --no-group --no-perms --progress --delete ~/media/* "$backup_drive/media/"
+sudo rsync -ra --no-owner --no-group --no-perms --progress --delete ~/documents/* "$backup_drive/documents/"
+sudo rsync -ra --no-owner --no-group --no-perms --progress --delete ~/downloads/* "$backup_drive/downloads/"
+sudo rsync -ra --no-owner --no-group --no-perms --progress --delete ~/.config/      "$backup_drive/dotfiles/.config/"
+sudo rsync -ra --no-owner --no-group --no-perms --progress --delete ~/.icons/       "$backup_drive/dotfiles/.icons/"
+sudo rsync -ra --no-owner --no-group --no-perms --progress --delete ~/.local/       "$backup_drive/dotfiles/.local/"
+sudo rsync -ra --no-owner --no-group --no-perms --progress --delete ~/.deno/        "$backup_drive/dotfiles/.deno/"
+sudo rsync -ra --no-owner --no-group --no-perms --progress --delete ~/go/           "$backup_drive/dotfiles/go/"
+sudo rsync -ra --no-owner --no-group --no-perms --progress ~/.bashrc ~/.bash_profile ~/.gtkrc-2.0 "$backup_drive/dotfiles/"

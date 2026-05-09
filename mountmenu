@@ -1,0 +1,32 @@
+#!/bin/sh
+command -v udisksctl >/dev/null 2>&1 || { dunstify -u low "please install udisksctl and try again" && exit 1; }
+
+choice="$(printf "mount\nunmount" | rofi -dmenu - "what would you like to do?")"
+
+if [ -n "$choice" ] && [ "$choice" = "mount" ]; then
+    mount_device="/dev/$(lsblk -b -no NAME,SIZE,TYPE,MOUNTPOINT | \
+        awk '$4=="" && $2>104857600 && $3=="part" { print $1,$2 } ' | \
+        numfmt --field=2 --to=iec-i --suffix=B | \
+        sed 's/^├─\|└─\|│ //g' | \
+        grep -E 'sd[a-z][1-9]?' | \
+        column -t | \
+        rofi -dmenu | \
+        awk '{ print $1 }')"
+    [ -n "$mount_device" ] && status=$(udisksctl mount -b "$mount_device" 2>&1)
+    [ -n "$status" ] && dunstify -u low "$status" && exit 0
+fi
+
+if [ -n "$choice" ] && [ "$choice" = "unmount" ]; then
+    unmount_device="/dev/$(lsblk -b -no NAME,SIZE,MOUNTPOINT | \
+        awk '$3 ~ /./' | \
+        numfmt --field=2 --to=iec-i --suffix=B | \
+        sed 's/^├─\|└─\|│ //g' | \
+        grep -E 'sd[a-z][1-9]?' | \
+        column -t | \
+        rofi -dmenu | \
+        awk '{ print $1 }')"
+    [ -n "$unmount_device" ] && status=$(udisksctl unmount -b "$unmount_device" 2>&1)
+    [ -n "$status" ] && dunstify -u low "$status" && exit 0
+fi
+dunsitfy -u low "Something went wrong"
+exit 0

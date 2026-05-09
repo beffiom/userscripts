@@ -1,0 +1,502 @@
+#!/usr/bin/env bash
+# embed_subs.sh — Download YouTube subs and embed them into local video files as MKV
+# Usage: ./embed_subs.sh [--dry-run] [VIDEO_DIR]
+#
+# Requires: ffprobe, yt-dlp, mkvmerge, mkvpropedit (mkvtoolnix)
+# Install:  sudo dnf install mkvtoolnix   (Fedora)
+#           sudo apt install mkvtoolnix   (Debian/Ubuntu)
+
+set -uo pipefail
+
+DRY_RUN=false
+VIDEO_DIR="."
+
+for arg in "$@"; do
+    case "$arg" in
+        --dry-run|-n) DRY_RUN=true ;;
+        --deps|-deps)
+            cat << 'DEPS'
+
+═══════════════════════════════════════════════════════════
+ embed_subs.sh — dependency reference
+═══════════════════════════════════════════════════════════
+
+REQUIRED
+────────────────────────────────────────────────────────────
+
+  ffmpeg / ffprobe
+  Used for: reading video metadata, integrity checks,
+            remuxing non-MKV sources
+    Fedora:  sudo dnf install ffmpeg
+    Ubuntu:  sudo apt install ffmpeg
+    Arch:    sudo pacman -S ffmpeg
+
+  yt-dlp
+  Used for: downloading subtitles from YouTube
+    Fedora:  sudo dnf install yt-dlp
+    Ubuntu:  sudo apt install yt-dlp
+             (or: pip install yt-dlp --break-system-packages)
+    Arch:    sudo pacman -S yt-dlp
+
+  mkvmerge + mkvpropedit  (mkvtoolnix)
+  Used for: muxing subtitles into MKV, fixing track dispositions
+    Fedora:  sudo dnf install mkvtoolnix
+    Ubuntu:  sudo apt install mkvtoolnix
+    Arch:    sudo pacman -S mkvtoolnix-cli
+
+  python3
+  Used for: parsing ffprobe JSON, cleaning SRT files (clean_srt.py)
+    Fedora:  sudo dnf install python3
+    Ubuntu:  sudo apt install python3
+    Arch:    sudo pacman -S python
+
+OPTIONAL
+────────────────────────────────────────────────────────────
+
+  alass  [RECOMMENDED for auto-sync]
+  Used for: syncing subtitle timestamps to audio
+            handles non-linear drift, no Python deps
+    Fedora:  sudo dnf install alass
+             (or binary: https://github.com/kaegi/alass/releases)
+    Ubuntu:  binary only: https://github.com/kaegi/alass/releases
+             curl -L https://github.com/kaegi/alass/releases/latest/download/alass-linux64                -o ~/.local/bin/alass && chmod +x ~/.local/bin/alass
+    Arch:    yay -S alass  (AUR)
+
+  ffsubsync  [fallback auto-sync if alass unavailable]
+  Used for: syncing subtitle timestamps to audio (linear offset only)
+            requires gcc + python3-devel/python3-dev to build webrtcvad
+    Fedora:  sudo dnf install python3-devel gcc
+             pip install ffsubsync --break-system-packages
+    Ubuntu:  sudo apt install python3-dev gcc
+             pip install ffsubsync --break-system-packages
+    Arch:    sudo pacman -S python gcc
+             pip install ffsubsync --break-system-packages
+
+COMPANION SCRIPTS
+────────────────────────────────────────────────────────────
+
+  clean_srt.py
+  Must be in the same directory as embed_subs.sh
+  Used for: fixing YouTube auto-caption timestamp overlap
+
+═══════════════════════════════════════════════════════════
+
+INSTALL ALL REQUIRED (quick copy-paste):
+
+  Fedora:  sudo dnf install ffmpeg yt-dlp mkvtoolnix python3
+  Ubuntu:  sudo apt install ffmpeg yt-dlp mkvtoolnix python3
+  Arch:    sudo pacman -S ffmpeg yt-dlp mkvtoolnix-cli python
+
+DEPS
+            exit 0
+            ;;
+        *) VIDEO_DIR="$arg" ;;
+    esac
+done
+
+if [[ "$DRY_RUN" == true ]]; then
+    echo "╔══════════════════════════════════════════╗"
+    echo "║           DRY RUN — no changes           ║"
+    echo "╚══════════════════════════════════════════╝"
+    echo ""
+fi
+
+SUBS_DIR=$(mktemp -d)
+OUTPUT_DIR=$(mktemp -d)
+trap 'rm -rf "$SUBS_DIR" "$OUTPUT_DIR"' EXIT
+
+declare -a SKIPPED_CORRUPT=()
+declare -a SKIPPED_NO_URL=()
+declare -a SKIPPED_NO_SUBS=()
+declare -a FAILED_MUX=()
+declare -a SUCCESS=()
+declare -a DRY_RUN_WOULD_PROCESS=()
+
+if ! command -v mkvmerge &>/dev/null; then
+    echo "ERROR: mkvmerge not found. Install mkvtoolnix:"
+    echo "  sudo dnf install mkvtoolnix   # Fedora"
+    echo "  sudo apt install mkvtoolnix   # Debian/Ubuntu"
+    exit 1
+fi
+
+# ── Language helpers ──────────────────────────────────────────────────────────
+
+iso_to_name() {
+    case "$1" in
+        en)   echo "English" ;;
+        fr)   echo "French" ;;
+        es)   echo "Spanish" ;;
+        it)   echo "Italian" ;;
+        pt)   echo "Portuguese" ;;
+        de)   echo "German" ;;
+        ja)   echo "Japanese" ;;
+        zh)   echo "Chinese" ;;
+        ko)   echo "Korean" ;;
+        ar)   echo "Arabic" ;;
+        ru)   echo "Russian" ;;
+        bn)   echo "Bengali" ;;
+        eo)   echo "Esperanto" ;;
+        la)   echo "Latin" ;;
+        hi)   echo "Hindi" ;;
+        *)    echo "$1" ;;
+    esac
+}
+
+lang_track_name() {
+    local code="$1"
+    if [[ "$code" == "en-orig" || "$code" == "en_orig" ]]; then
+        echo "English (Original)"; return
+    fi
+    if [[ "$code" == *-* ]]; then
+        local part1="${code%%-*}"
+        local part2="${code#*-}"
+        if [[ "$part2" =~ ^[A-Z]{2,}$ ]] || [[ "$part2" == "Hans" ]] || [[ "$part2" == "Hant" ]]; then
+            echo "$(iso_to_name "$part1") ($part2)"; return
+        fi
+        echo "$(iso_to_name "$part2") (Translated)"; return
+    fi
+    iso_to_name "$code"
+}
+
+lang_iso() {
+    local code="$1"
+    if [[ "$code" == "en-orig" || "$code" == "en_orig" ]]; then echo "en"; return; fi
+    if [[ "$code" == *-* ]]; then
+        local part1="${code%%-*}"
+        local part2="${code#*-}"
+        if [[ "$part2" =~ ^[A-Z]{2,}$ ]] || [[ "$part2" == "Hans" ]] || [[ "$part2" == "Hant" ]]; then
+            echo "$part1"; return
+        fi
+        echo "$part2"; return
+    fi
+    echo "$code"
+}
+
+# ── Corruption check ──────────────────────────────────────────────────────────
+# Only uses ffprobe — avoids ffmpeg null-decode which produces false positives
+# on valid MKVs with Opus audio or h264 streams without a full decoder context.
+check_file() {
+    local f="$1"
+
+    local probe
+    probe=$(ffprobe -v error -print_format json -show_streams -show_format "$f" 2>&1)
+    if [[ $? -ne 0 ]]; then
+        echo "  [CORRUPT] ffprobe failed to parse container." >&2
+        return 1
+    fi
+
+    local check
+    check=$(echo "$probe" | python3 -c "
+import json, sys
+try:
+    d = json.loads(sys.stdin.read())
+    streams = d.get('streams', [])
+    has_video = any(s['codec_type'] == 'video' for s in streams)
+    has_audio = any(s['codec_type'] == 'audio' for s in streams)
+    duration  = float(d.get('format', {}).get('duration', 0))
+    if not has_video:   print('no_video')
+    elif not has_audio: print('no_audio')
+    elif duration <= 0: print('no_duration')
+    else:               print('ok')
+except: print('parse_error')
+")
+
+    case "$check" in
+        no_video)    echo "  [CORRUPT] No video stream found." >&2;          return 1 ;;
+        no_audio)    echo "  [CORRUPT] No audio stream found." >&2;          return 1 ;;
+        no_duration) echo "  [CORRUPT] Duration is zero or missing." >&2;    return 1 ;;
+        parse_error) echo "  [CORRUPT] Could not parse ffprobe output." >&2; return 1 ;;
+    esac
+
+    return 0
+}
+
+# ── Dry-run subtitle availability check (no download) ─────────────────────────
+check_subs_available() {
+    local url="$1"
+    local result
+    result=$(yt-dlp --list-subs --skip-download "$url" 2>/dev/null)
+    # Check if any of our target languages appear in the listing
+    if echo "$result" | grep -qE '^\s*(en|fr|es|it|pt|bn|eo|la)'; then
+        return 0
+    fi
+    return 1
+}
+
+# ── Main loop ─────────────────────────────────────────────────────────────────
+
+shopt -s nullglob
+video_files=("$VIDEO_DIR"/*.{mp4,mkv,webm,avi,mov,flv,ts,m4v})
+shopt -u nullglob
+
+if [[ ${#video_files[@]} -eq 0 ]]; then
+    echo "No video files found in '$VIDEO_DIR'."
+    exit 0
+fi
+
+for orig in "${video_files[@]}"; do
+    filename="$(basename "$orig")"
+    base="${filename%.*}"
+
+    echo "──────────────────────────────────────────"
+    echo "Processing: $filename"
+
+    # ── Integrity check (always runs, even in dry-run) ────────────────────────
+    echo "  Checking integrity..."
+    if ! check_file "$orig"; then
+        echo "  [SKIP] File failed integrity check."
+        SKIPPED_CORRUPT+=("$filename")
+        continue
+    fi
+    echo "  Integrity OK."
+
+    # ── Note existing subtitle streams (will be replaced if new subs found) ─────
+    STREAMS_JSON=$(ffprobe -v quiet -print_format json -show_streams "$orig" 2>/dev/null)
+    existing_sub_count=$(echo "$STREAMS_JSON" | python3 -c "
+import json,sys
+d=json.load(sys.stdin)
+print(sum(1 for s in d['streams'] if s['codec_type']=='subtitle'))
+")
+    if [[ "$existing_sub_count" -gt 0 ]]; then
+        echo "  Has $existing_sub_count existing subtitle stream(s) — will replace if new subs found."
+    fi
+
+    # ── Extract YouTube URL ───────────────────────────────────────────────────
+    FFPROBE_JSON=$(ffprobe -v quiet -print_format json -show_entries format_tags "$orig" 2>/dev/null)
+    URL=$(echo "$FFPROBE_JSON" | python3 -c "
+import json,sys,re
+d=json.load(sys.stdin)
+tags=d.get('format',{}).get('tags',{})
+yt=re.compile(r'youtube\.com|youtu\.be')
+for key in ['PURL','purl']:
+    val=tags.get(key,'').split('\n')[0].strip()
+    if yt.search(val):
+        print(val); sys.exit(0)
+for key,val in tags.items():
+    if 'comment' in key.lower():
+        val=val.split('\n')[0].strip()
+        if yt.search(val):
+            print(val); sys.exit(0)
+" 2>/dev/null || true)
+
+    if [[ -z "$URL" ]]; then
+        echo "  [SKIP] No YouTube URL found in metadata."
+        SKIPPED_NO_URL+=("$filename")
+        continue
+    fi
+
+    ID=$(echo "$URL" | sed -n 's|.*watch?v=\([^&]*\).*|\1|p')
+    [[ -z "$ID" ]] && ID=$(echo "$URL" | sed -n 's|.*youtu\.be/\([^?&]*\).*|\1|p')
+    if [[ -z "$ID" ]]; then
+        echo "  [SKIP] Could not parse YouTube ID from: $URL"
+        SKIPPED_NO_URL+=("$filename (unparseable URL)")
+        continue
+    fi
+
+    echo "  URL : $URL  (ID: $ID)"
+
+    # ── Dry run: check subtitle availability without downloading ──────────────
+    if [[ "$DRY_RUN" == true ]]; then
+        echo "  [DRY RUN] Checking subtitle availability (no download)..."
+        if check_subs_available "$URL"; then
+            if [[ "$existing_sub_count" -gt 0 ]]; then
+                echo "  [DRY RUN] Would replace $existing_sub_count existing subtitle stream(s) with new subs."
+                DRY_RUN_WOULD_PROCESS+=("$filename — replace existing subtitles")
+            else
+                echo "  [DRY RUN] Would download and embed subtitles."
+                DRY_RUN_WOULD_PROCESS+=("$filename — download & embed subtitles")
+            fi
+        else
+            echo "  [DRY RUN] No subtitles appear to be available."
+            SKIPPED_NO_SUBS+=("$filename (dry-run check: none available)")
+        fi
+        continue
+    fi
+
+    # ── Download subtitles ────────────────────────────────────────────────────
+    # --sleep-requests and --sleep-interval add delays between requests to avoid
+    # 429 Too Many Requests errors when downloading multiple subtitle languages.
+    echo "  Downloading subtitles..."
+    yt-dlp \
+        --write-auto-sub \
+        --write-sub \
+        --sub-lang "en.*,fr.*,es.*,it.*,pt.*,bn.*,eo.*,la.*" \
+        --sub-format srt \
+        --skip-download \
+        --sleep-requests 2 \
+        --sleep-interval 3 \
+        --output "$SUBS_DIR/${ID}.%(ext)s" \
+        "$URL" || true
+
+    # ── Rename SRTs to human track names ─────────────────────────────────────
+    declare -a srt_files=()
+    declare -a track_names=()
+    declare -a track_langs=()
+
+    while IFS= read -r -d '' f; do
+        fname="$(basename "$f" .srt)"
+        lang_full="${fname#${ID}.}"
+        track_name="$(lang_track_name "$lang_full")"
+        iso="$(lang_iso "$lang_full")"
+        new_path="$SUBS_DIR/${track_name}.srt"
+        mv "$f" "$new_path"
+        srt_files+=("$new_path")
+        track_names+=("$track_name")
+        track_langs+=("$iso")
+        echo "    → $track_name  [$iso]"
+    done < <(find "$SUBS_DIR" -maxdepth 1 -type f -name "${ID}.*.srt" -print0 | sort -z)
+
+    if [[ ${#srt_files[@]} -eq 0 ]]; then
+        echo "  [SKIP] No subtitles downloaded."
+        SKIPPED_NO_SUBS+=("$filename")
+        continue
+    fi
+
+    # ── Clean rolling/progressive subtitle duplicates ─────────────────────────
+    # YouTube auto-captions have overlapping timestamps causing double-line display.
+    # clean_srt.py trims each cue's end to the next cue's start, fixing this.
+    echo "  Cleaning subtitle cues..."
+    for srt in "${srt_files[@]}"; do
+        python3 "$(dirname "$0")/clean_srt.py" "$srt"
+    done
+
+    # ── Auto-sync subtitles to audio ─────────────────────────────────────────
+    # Tries alass first (preferred — handles non-linear drift, no Python deps),
+    # then falls back to ffsubsync. Skips if neither is installed.
+    #
+    # Install alass:     sudo dnf install alass
+    # Install ffsubsync: pip install ffsubsync --break-system-packages
+    if command -v alass &>/dev/null || command -v ffsubsync &>/dev/null; then
+        echo "  Auto-syncing subtitles to audio..."
+        for srt in "${srt_files[@]}"; do
+            srt_name="$(basename "$srt")"
+            synced="${srt%.srt}.synced.srt"
+            synced_ok=false
+
+            if command -v alass &>/dev/null; then
+                # alass takes: <reference_video> <input_srt> <output_srt>
+                if alass "$orig" "$srt" "$synced" 2>/dev/null; then
+                    synced_ok=true
+                    echo "    ✓ Synced (alass): $srt_name"
+                else
+                    rm -f "$synced"
+                    echo "    ⚠ alass failed for $srt_name — trying ffsubsync..."
+                fi
+            fi
+
+            if [[ "$synced_ok" == false ]] && command -v ffsubsync &>/dev/null; then
+                if ffsubsync "$orig" -i "$srt" -o "$synced" --no-fix-framerate 2>/dev/null; then
+                    synced_ok=true
+                    echo "    ✓ Synced (ffsubsync): $srt_name"
+                else
+                    rm -f "$synced"
+                    echo "    ⚠ ffsubsync failed for $srt_name — using unsynced version"
+                fi
+            fi
+
+            [[ "$synced_ok" == true ]] && mv "$synced" "$srt"
+        done
+    else
+        echo "  (no sync tool found — skipping. Install: sudo dnf install alass)"
+    fi
+
+    # ── Mux with mkvmerge into temp output ───────────────────────────────────
+    out_file="$OUTPUT_DIR/${base}.mkv"
+    echo "  Muxing → $out_file"
+
+    # If the source file has existing subtitle tracks, exclude them so we start clean.
+    # mkvmerge --no-subtitles strips all subtitle tracks from the source file only.
+    if [[ "$existing_sub_count" -gt 0 ]]; then
+        echo "  Stripping $existing_sub_count existing subtitle track(s) before remux."
+        mkvmerge_args=("--no-subtitles" "$orig")
+    else
+        mkvmerge_args=("$orig")
+    fi
+    first=true
+    for i in "${!srt_files[@]}"; do
+        srt="${srt_files[$i]}"
+        name="${track_names[$i]}"
+        iso="${track_langs[$i]}"
+        if [[ "$first" == true ]]; then
+            mkvmerge_args+=("--track-name" "0:${name}" "--language" "0:${iso}" "--default-track" "0:yes" "$srt")
+            first=false
+        else
+            mkvmerge_args+=("--track-name" "0:${name}" "--language" "0:${iso}" "--default-track" "0:no" "$srt")
+        fi
+    done
+
+    if ! mkvmerge -o "$out_file" "${mkvmerge_args[@]}"; then
+        echo "  ✗ mkvmerge failed — original file untouched."
+        FAILED_MUX+=("$filename")
+        for srt in "${srt_files[@]}"; do rm -f "$srt"; done
+        continue
+    fi
+
+    # ── Verify output before replacing original ───────────────────────────────
+    echo "  Verifying output integrity..."
+    if ! check_file "$out_file"; then
+        echo "  ✗ Output file failed integrity check — original file untouched."
+        FAILED_MUX+=("$filename (output corrupt)")
+        rm -f "$out_file"
+        for srt in "${srt_files[@]}"; do rm -f "$srt"; done
+        continue
+    fi
+
+    # ── Replace original with new MKV ────────────────────────────────────────
+    dest="${VIDEO_DIR}/${base}.mkv"
+    mv "$out_file" "$dest"
+    [[ "$orig" != "$dest" ]] && rm -f "$orig"
+
+    for srt in "${srt_files[@]}"; do rm -f "$srt"; done
+
+    echo "  ✓ Done: $dest"
+    SUCCESS+=("$filename")
+done
+
+# ── Summary ───────────────────────────────────────────────────────────────────
+echo ""
+echo "════════════════════════════════════════════"
+if [[ "$DRY_RUN" == true ]]; then
+    echo "DRY RUN SUMMARY (nothing was changed)"
+else
+    echo "SUMMARY"
+fi
+echo "════════════════════════════════════════════"
+
+if [[ "$DRY_RUN" == true ]] && [[ ${#DRY_RUN_WOULD_PROCESS[@]} -gt 0 ]]; then
+    echo ""
+    echo "→ Would process (${#DRY_RUN_WOULD_PROCESS[@]}):"
+    for f in "${DRY_RUN_WOULD_PROCESS[@]}"; do echo "    $f"; done
+fi
+
+if [[ ${#SUCCESS[@]} -gt 0 ]]; then
+    echo ""
+    echo "✓ Completed (${#SUCCESS[@]}):"
+    for f in "${SUCCESS[@]}"; do echo "    $f"; done
+fi
+
+if [[ ${#SKIPPED_NO_URL[@]} -gt 0 ]]; then
+    echo ""
+    echo "— Skipped, no YouTube URL in metadata (${#SKIPPED_NO_URL[@]}):"
+    for f in "${SKIPPED_NO_URL[@]}"; do echo "    $f"; done
+fi
+
+if [[ ${#SKIPPED_NO_SUBS[@]} -gt 0 ]]; then
+    echo ""
+    echo "— Skipped, no subtitles available (${#SKIPPED_NO_SUBS[@]}):"
+    for f in "${SKIPPED_NO_SUBS[@]}"; do echo "    $f"; done
+fi
+
+if [[ ${#FAILED_MUX[@]} -gt 0 ]]; then
+    echo ""
+    echo "✗ Failed to mux (${#FAILED_MUX[@]}):"
+    for f in "${FAILED_MUX[@]}"; do echo "    $f"; done
+fi
+
+if [[ ${#SKIPPED_CORRUPT[@]} -gt 0 ]]; then
+    echo ""
+    echo "✗ CORRUPT / UNREADABLE (${#SKIPPED_CORRUPT[@]}):"
+    for f in "${SKIPPED_CORRUPT[@]}"; do echo "    $f"; done
+fi
+
+echo ""

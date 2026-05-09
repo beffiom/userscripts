@@ -1,0 +1,6 @@
+#!/bin/sh
+# Sets the background. If given an argument, will set file as background.
+[ ! -z "$1" ] && cp "$1" ~/media/photos/wallpaper.png
+pkill 'swaybg'
+nohup swaybg -m fill -i ~/media/photos/wallpaper.png &> ~/.cache/nohup.out &
+dunstify -r 2 -u low -i ~/media/photos/wallpaper.png "wallpaper updated!"

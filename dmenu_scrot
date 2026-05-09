@@ -1,0 +1,13 @@
+#!/bin/sh
+choice="$(printf "screenshot area\\nscreenshot window\\nscreenshot output\\nscreenshot area (copy)\\nscreenshot window (copy)\\nscreenshot output (copy)" | ~/.config/userscripts/dmenu/dmenu)"
+
+case "$choice" in
+    "screenshot area") grim -g "$(slurp)" ~/media/photos/screenshots/screenshot-$(date '+%Y%m%d-%H%M%S').png ;;
+    "screenshot window") grim -l "$(hyprctl activewindow -j | jq -r '.at[] | @csv' | sed 's/,/ /g')" ~/media/photos/screenshots/screenshot-$(date '+%Y%m%d-%H%M%S').png ;;
+    "screenshot output") grim ~/media/photos/screenshots/screenshot-$(date '+%Y%m%d-%H%M%S').png ;;
+    "screenshot area (copy)") grim -g "$(slurp)" - | wl-copy ;;
+    "screenshot window (copy)") grim -l "$(hyprctl activewindow -j | jq -r '.at[] | @csv' | sed 's/,/ /g')" - | wl-copy ;;
+    "screenshot output (copy)") grim - | wl-copy ;;
+esac
+notify-send "Screenshot taken"
+

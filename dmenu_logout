@@ -1,0 +1,8 @@
+#!/bin/sh
+choice=$(printf "logout\nreboot\nshutdown" | rofi -dmenu)
+
+case "$choice" in
+    "logout") [ "$(printf "no\nyes" | rofi -dmenu -p "really logout?")" = "yes" ] && loginctl terminate-user "" ;;
+    "reboot") [ "$(printf "no\nyes" | rofi -dmenu -p "really reboot?")" = "yes" ] && reboot ;;
+    "shutdown") [ "$(printf "no\nyes" | rofi -dmenu -p "really shutdown?")" = "yes" ] && shutdown -h now ;;
+esac

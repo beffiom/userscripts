@@ -1,0 +1,40 @@
+#!/bin/sh
+
+shortcuts=$HOME/.config/misc/shortcuts
+bashrc=$HOME/.bashrc
+bash_shortcuts=$HOME/.config/bash/shortcutrc
+yazi_shortcuts=/tmp/shortcut.toml
+yazi_keymap=$HOME/.config/yazi/keymap.toml
+
+# Prepare files
+
+# Create files
+# bash
+rm -f "$bash_shortcuts"
+mkdir -p $HOME/.config/bash
+touch "$bash_shortcuts"
+awk '{print "alias "$2"=\"cd "$3"\""}' "$shortcuts" | tee "$bash_shortcuts"
+source "$bashrc"
+
+# yazi
+mkdir -p $HOME/.config/yazi
+touch "$yazi_shortcuts"
+awk '{
+  cmd=$2; n=split(cmd,a,"");
+  printf "    { on = [ ";
+  for(i=1;i<=n;i++) printf "\"%s\"%s", a[i], (i<n ? ", " : "");
+  printf " ], run = \"cd "$3"\", desc= \"Go to the "$1" directory\" },\n"
+}' "$shortcuts" | tee "$yazi_shortcuts"
+awk -v src="$yazi_shortcuts" '
+/    # Go-To Start/,/    # Go-To End/ {
+  if ($0 ~ /    # Go-To Start/) {
+    print "    # Go-To Start"
+    while ((getline line < src) > 0) print line
+    close(src)
+    next
+  }
+}
+1
+' "$yazi_keymap" > "$yazi_keymap".tmp && mv "$yazi_keymap".tmp "$yazi_keymap"
+
+dunstify -u low "shortcuts updated"

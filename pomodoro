@@ -1,0 +1,40 @@
+#!/bin/sh
+
+usage() {
+    cat >&2 <<EOF
+pomodoro
+-------
+timer that countsdown until complete
+
+Usage: pomodoro [-m] [-s]
+    -m Minutes
+    -s Seconds
+    -h Show this usage page
+EOF
+}
+main() {
+    local minutes=0 seconds=0
+    # Parse options
+    while getopts "m:s:h" opt; do
+      case $opt in
+        m) minutes=$OPTARG;;
+        s) seconds=$OPTARG;;
+        h) usage; exit 0 ;;
+        ?) usage >&2; exit 1 ;;
+      esac
+    done
+    shift $((OPTIND-1))
+
+    total=$((minutes * 60 + seconds))
+
+    while (( total >= 0 )); do
+      clear
+      printf "%02d:%02d\n" $((total / 60)) $((total % 60))
+      sleep 1
+      ((total--))
+    done
+    dunstify -u n "Timer Complete"
+    exit 0
+}
+
+main "$@"

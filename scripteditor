@@ -1,0 +1,17 @@
+#!/bin/sh
+
+menu=false
+scripts_dir="$HOME/.config/userscripts"
+
+while getopts 'm' opt; do
+  case "$opt" in
+    m) menu=true ;;
+    ?) exit 1 ;;
+  esac
+done
+
+
+[ "$menu" = "false" ] && script=$(ls "$scripts_dir" | fzf)
+[ "$menu" = "false" ] || script=$(ls "$scripts_dir" | rofi -dmenu -p "select a script")
+
+[ -n "$script" ] && nvim "$scripts_dir/$script"

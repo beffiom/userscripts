@@ -1,0 +1,138 @@
+#!/bin/sh
+set -euo pipefail  # Exit on error, unset vars, pipe fails
+
+DEPENDENCIES=(hxselect w3m fzf curl column awk sed grep)
+
+usage() {
+    cat >&2 <<EOF
+sep
+-------
+browse and retrieve entries from the stanford encyclopedia of philosophy
+
+Usage: sep [-q]
+    -q query pattern
+    -r random entry
+    -l list alphabetically
+    -h show this usage page
+
+Dependencies: ${DEPENDENCIES[@]}
+EOF
+}
+check_deps() {
+  local missing=()
+
+  for dep in "${deps[@]}"; do
+    if ! command -v "$DEPENDENCIES" >/dev/null 2>&1; then
+      missing+=("$DEPENDENCIES")
+    fi
+  done
+
+  if [ ${#missing[@]} -ne 0 ]; then
+    cat >&2 <<EOF
+Missing dependencies: ${missing[*]}
+Install with:
+  Arch: sudo pacman -S html-xml-utils w3m fzf coreutils
+  Fedora: sudo dnf install html-xml-utils w3m fzf util-linux coreutils
+  Ubuntu: sudo apt install html-xml-utils w3m fzf coreutils
+EOF
+    exit 1
+  fi
+}
+print_entry() {
+    url=$1
+    curl -Ls "$url" | hxselect -c '#article-content' | w3m -dump -T text/html | bat -n
+}
+query() {
+    query_term=$1
+    url=$(for page in $(seq 1 5); do
+      curl -s "https://plato.stanford.edu/search/search?page=$page&query=$query_term&prepend=None"
+    done |
+    awk '
+    BEGIN {
+      RS="<div class=\"result_listing\">"
+    }
+    NR > 1 {
+      block = $0
+
+      title = ""
+      link  = ""
+
+      if (match(block, /<div class="result_title">[[:space:]]*<a[^>]*>([^<]|<b>[^<]*<\/b>)*/, m)) {
+        title = m[0]
+        sub(/^.*<a[^>]*>/, "", title)
+        gsub(/<[^>]+>/, "", title)
+        gsub(/^[[:space:]]+|[[:space:]]+$/, "", title)
+      }
+
+      if (match(block, /<div class="result_url">[[:space:]]*<a href="([^"]+)"/, m)) {
+        link = m[1]
+        gsub(/&amp;/, "\\&", link)
+        sub(/^https:\/\/plato\.stanford\.edu\/search\/r\?entry=\//, "https://plato.stanford.edu/", link)
+        sub(/\/&.*/, "/", link)
+      }
+
+      if (title != "" && link != "")
+        printf "%s\t%s\n", title, link
+    }
+    ' | column -ts $'\t' | fzf | awk -F ' {3,}' '{ print $2 }')
+    print_entry "$url"
+    exit 0
+}
+list() {
+    url=$(curl -s 'https://plato.stanford.edu/published.html' |
+    sed -n 's/.*<a href="\([^"]*\)">\(.*\)<\/a>.*/\2 \|\|\| \1/p' |
+    sed '
+        s/.*<a href="\([^"]*\)">\(.*\)<\/a>.*/\2 ||| \1/
+        s/&amp;/\&/g
+        s/&rsquo;/\x27/g
+        s/&#257;/ā/g
+        s/&#256;/ā/g
+        s/&#703;/`/g
+        s/&#346;/Ś/g
+        s/&#299;/ī/g
+        s/&#7779;/ṣ/g
+        s/&#257;/ā/g
+        s/&#777;/ṣ/g
+        s/&#39;/’/g
+        s/&amp;/\&/g
+        s/&#269;/č/g
+        s/&#351;/š/g
+        s/&#365;/ǔ/g ' |
+    awk -F' \\|\\|\\| ' '
+    BEGIN { title_width = 60 }
+    {
+      title = $1
+      link  = $2
+      gsub(/<[^>]+>/, "", title)
+      gsub(/^ */, "", title)
+      gsub(/ *$/, "", title)
+      printf "%-*s  %s\n", title_width, title, link
+    }' |
+    grep -s "https://plato.stanford.edu/entries/" |
+    sort -u |
+    fzf |
+    awk -F ' {3,}' '{ print $2 }')
+    print_entry "$url"
+    exit 0
+}
+random() {
+    print_entry "https://plato.stanford.edu/cgi-bin/encyclopedia/random"
+    exit 0
+}
+main() {
+    check_deps
+    # Parse options
+    while getopts "q:rlh" opt; do
+      case $opt in
+        q) query "$OPTARG" ;;
+        r) random ;;
+        l) list ;;
+        h) usage; exit 0 ;;
+        ?) usage >&2; exit 1 ;;
+      esac
+    done
+    shift $((OPTIND-1))
+    usage >&2; exit 1
+}
+
+main "$@"

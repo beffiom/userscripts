@@ -1,0 +1,7 @@
+#!/bin/sh
+set -eu
+
+# Run all watches in background, or run one at a time in foreground
+exec <<'EOF'
+echo $HOME/.config/misc/shortcuts | entr -s $HOME/.config/userscripts/shortcutman
+EOF

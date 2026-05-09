@@ -1,0 +1,822 @@
+#!/usr/bin/env bash
+# sub-merge — Subtitle styling, language tagging, and MKV muxing pipeline
+#
+# Scans a directory recursively, finds all subtitle tracks (embedded or external),
+# applies Anime Ace 2 ASS styling, detects languages, and merges everything into MKV.
+#
+# Usage: sub-merge [OPTIONS] [DIRECTORY]
+#
+# Options:
+#   -l, --verbose     Show detailed debug output
+#   -s, --sync        Enable alass time-sync (safe: only applied if offset is significant)
+#   -n, --dry-run     Preview actions without modifying any files
+#   -r FILE           Rollback a previous run using its log file
+#   -d, --deps        Show dependency info and install commands
+#   -h, --help        Show this help
+#
+# ── Dependencies ──────────────────────────────────────────────────────────────
+# REQUIRED
+#   ffmpeg / ffprobe   Video probing, subtitle extraction, format conversion
+#     Fedora:  sudo dnf install ffmpeg
+#     Ubuntu:  sudo apt install ffmpeg
+#
+#   mkvmerge           Muxing subtitles into MKV containers (mkvtoolnix)
+#     Fedora:  sudo dnf install mkvtoolnix
+#     Ubuntu:  sudo apt install mkvtoolnix
+#
+#   python3            ASS conversion, JSON parsing
+#     Fedora:  sudo dnf install python3
+#     Ubuntu:  sudo apt install python3
+#
+# OPTIONAL
+#   pgsrip             OCR for PGS/Blu-ray bitmap subtitle tracks
+#     All:     pip install pgsrip --break-system-packages
+#     Also needs Tesseract + language packs:
+#     Fedora:  sudo dnf install tesseract tesseract-langpack-eng tesseract-langpack-fra ...
+#     Ubuntu:  sudo apt install tesseract-ocr tesseract-ocr-eng tesseract-ocr-fra ...
+#
+#   alass              Subtitle time-sync (used with -s flag)
+#     All:     cargo install alass-cli
+#     Binary:  https://github.com/kaegi/alass/releases
+#
+#   langdetect         Content-based language detection for untagged subtitles
+#     All:     pip install langdetect --break-system-packages
+#
+#   uchardet           Encoding detection for non-UTF-8 subtitle files
+#     Fedora:  sudo dnf install uchardet
+#     Ubuntu:  sudo apt install uchardet
+# ─────────────────────────────────────────────────────────────────────────────
+
+set -euo pipefail
+
+# ── Style ─────────────────────────────────────────────────────────────────────
+R='\033[0m'; BOLD='\033[1m'; DIM='\033[2m'
+RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
+CYAN='\033[0;36m'; BLUE='\033[0;34m'; MAGENTA='\033[0;35m'
+
+# ── Anime Ace 2 ASS style ─────────────────────────────────────────────────────
+ASS_STYLE="Style: Default,Anime Ace 2,22,&H00FFFFFF,&H000000FF,&H00000000,&H80000000,0,0,0,0,100,100,0,0,1,1.2,0.75,2,10,10,10,1"
+ASS_HEADER="[Script Info]
+ScriptType: v4.00+
+PlayResX: 640
+PlayResY: 480
+ScaledBorderAndShadow: yes
+
+[V4+ Styles]
+Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
+${ASS_STYLE}
+
+[Events]
+Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text"
+
+# ── Defaults ──────────────────────────────────────────────────────────────────
+TARGET_DIR="."
+VERBOSE=false
+SYNC=false
+DRY_RUN=false
+ROLLBACK_FILE=""
+TMPDIR_BASE="$(mktemp -d)"
+trap 'rm -rf "$TMPDIR_BASE"' EXIT
+trap '_sub_merge_interrupted=true; echo -e "\n\033[1;33m  ⚠ Interrupted — killing background jobs...\033[0m"; kill 0; exit 130' INT TERM
+
+VIDEO_EXTS=(mp4 mkv avi mov wmv flv webm m4v ts mpg mpeg)
+SUB_EXTS=(srt ass ssa vtt smi)
+
+# Counters
+TOTAL=0; DONE=0; SKIPPED=0; FAILED=0
+declare -a FAILED_FILES=()
+
+# ── Log file setup ────────────────────────────────────────────────────────────
+LOG_FILE="sub-merge-$(date +%Y%m%d-%H%M%S).log"
+
+# ── Logging ───────────────────────────────────────────────────────────────────
+info()    { echo -e "${CYAN}  →${R} $*"; }
+ok()      { echo -e "${GREEN}  ✓${R} $*"; }
+warn()    { echo -e "${YELLOW}  ⚠${R} $*"; }
+err()     { echo -e "${RED}  ✗${R} $*" >&2; }
+debug()   { $VERBOSE && echo -e "${DIM}    $*${R}" || true; }
+section() { echo -e "\n${BOLD}${BLUE}▶${R} ${BOLD}$*${R}"; }
+rule()    { echo -e "${DIM}────────────────────────────────────────${R}"; }
+
+log_op() {
+  # log_op BACKUP /original /backup
+  # log_op CREATED /path
+  echo -e "$1\t${2}\t${3:-}" >> "$LOG_FILE"
+}
+
+# ── Usage ─────────────────────────────────────────────────────────────────────
+usage() {
+  sed -n '/^# Usage/,/^$/p' "$0" | sed 's/^# \?//'
+  exit 0
+}
+
+# ── Argument parsing ──────────────────────────────────────────────────────────
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -l|--verbose) VERBOSE=true ;;
+    -s|--sync)    SYNC=true ;;
+    -n|--dry-run) DRY_RUN=true ;;
+    -r)           shift; ROLLBACK_FILE="$1" ;;
+    -d|--deps)    sed -n '/^# ── Dependencies/,/^# ──────/p' "$0" | sed 's/^# \?//'; exit 0 ;;
+    -h|--help)    usage ;;
+    -*) err "Unknown option: $1"; exit 1 ;;
+    *)  TARGET_DIR="$1" ;;
+  esac
+  shift
+done
+
+# ── Rollback mode ─────────────────────────────────────────────────────────────
+if [[ -n "$ROLLBACK_FILE" ]]; then
+  [[ ! -f "$ROLLBACK_FILE" ]] && { err "Log file not found: $ROLLBACK_FILE"; exit 1; }
+  echo -e "\n${BOLD}${YELLOW}⟲  Rolling back from: $ROLLBACK_FILE${R}\n"
+  restored=0; removed=0; rb_failed=0
+  while IFS=$'\t' read -r op src dst; do
+    [[ "$op" == "#"* || -z "$op" ]] && continue
+    case "$op" in
+      BACKUP)
+        if [[ -f "$dst" ]]; then
+          mkdir -p "$(dirname "$src")"
+          mv "$dst" "$src"
+          ok "Restored: $(basename "$src")"
+          ((restored++)) || true
+        else
+          warn "Backup not found, skipping: $dst"
+        fi
+        ;;
+      CREATED)
+        if [[ -f "$src" ]]; then
+          rm -f "$src"
+          ok "Removed:  $(basename "$src")"
+          ((removed++)) || true
+        fi
+        ;;
+      *) debug "Skipping unknown op: $op" ;;
+    esac
+  done < "$ROLLBACK_FILE"
+  echo -e "\n${BOLD}Rollback complete.${R}"
+  echo -e "  Restored : ${restored} file(s)"
+  echo -e "  Removed  : ${removed} file(s)"
+  exit 0
+fi
+
+# ── Dependency check ──────────────────────────────────────────────────────────
+check_deps() {
+  local missing=()
+  for cmd in ffmpeg ffprobe mkvmerge python3; do
+    command -v "$cmd" &>/dev/null || missing+=("$cmd")
+  done
+  if [[ ${#missing[@]} -gt 0 ]]; then
+    err "Missing required tools: ${missing[*]}"
+    echo ""
+    [[ " ${missing[*]} " =~ " mkvmerge " ]] && echo "  mkvmerge : sudo dnf install mkvtoolnix"
+    [[ " ${missing[*]} " =~ " ffmpeg "   ]] && echo "  ffmpeg   : sudo dnf install ffmpeg"
+    exit 1
+  fi
+  if $SYNC && ! command -v alass &>/dev/null; then
+    warn "alass not found — --sync disabled. Install: cargo install alass-cli"
+    SYNC=false
+  fi
+  if command -v pgsrip &>/dev/null; then
+    HAS_PGSRIP=true
+  else
+    HAS_PGSRIP=false
+    warn "pgsrip not found — PGS tracks will be kept as-is (no OCR). Install: pip install pgsrip --break-system-packages"
+  fi
+  if ! python3 -c "import langdetect" 2>/dev/null; then
+    debug "langdetect not installed — language detection will use filename only"
+    debug "Install: pip install langdetect --break-system-packages"
+    HAS_LANGDETECT=false
+  else
+    HAS_LANGDETECT=true
+  fi
+}
+
+# ── Language maps ─────────────────────────────────────────────────────────────
+declare -A ISO1_TO_ISO3=(
+  # ISO 639-1 (2-letter)
+  [en]=eng [fr]=fra [de]=deu [es]=spa [it]=ita [pt]=por [nl]=nld [pl]=pol
+  [ru]=rus [ja]=jpn [ko]=kor [zh]=zho [ar]=ara [sv]=swe [no]=nor [da]=dan
+  [fi]=fin [cs]=ces [hu]=hun [ro]=ron [tr]=tur [he]=heb [hi]=hin [th]=tha
+  [vi]=vie [id]=ind [uk]=ukr [el]=ell [bg]=bul [hr]=hrv [sk]=slk [lt]=lit
+  [lv]=lav [et]=est [sl]=slv
+  # ISO 639-2/B bibliographic aliases (used by many MKV/Blu-ray files)
+  [fre]=fra [ger]=deu [dut]=nld [chi]=zho [cze]=ces [rum]=ron [gre]=ell
+  [slo]=slk [alb]=sqi [arm]=hye [baq]=eus [geo]=kat [ice]=isl [mac]=mkd
+  [may]=msa [mao]=mri [per]=fas [tib]=bod [wel]=cym
+)
+declare -A ISO3_TO_NAME=(
+  [eng]=English [fra]=French [deu]=German [spa]=Spanish [ita]=Italian
+  [por]=Portuguese [nld]=Dutch [pol]=Polish [rus]=Russian [jpn]=Japanese
+  [kor]=Korean [zho]=Chinese [ara]=Arabic [swe]=Swedish [nor]=Norwegian
+  [dan]=Danish [fin]=Finnish [ces]=Czech [hun]=Hungarian [ron]=Romanian
+  [tur]=Turkish [heb]=Hebrew [hin]=Hindi [tha]=Thai [vie]=Vietnamese
+  [ind]=Indonesian [ukr]=Ukrainian [ell]=Greek [bul]=Bulgarian [hrv]=Croatian
+  [slk]=Slovak [lit]=Lithuanian [lav]=Latvian [est]=Estonian [slv]=Slovenian
+  [sqi]=Albanian [hye]=Armenian [eus]=Basque [kat]=Georgian [isl]=Icelandic
+  [mkd]=Macedonian [msa]=Malay [mri]=Maori [fas]=Persian [bod]=Tibetan
+  [cym]=Welsh [und]=Unknown
+)
+# Pass-through for already-ISO3 codes
+for k in "${!ISO3_TO_NAME[@]}"; do ISO1_TO_ISO3[$k]=$k; done
+
+resolve_lang() {
+  local code="${1,,}"
+  echo "${ISO1_TO_ISO3[$code]:-und}"
+}
+
+lang_name() {
+  local iso3="$1"
+  echo "${ISO3_TO_NAME[$iso3]:-$iso3}"
+}
+
+# ── Language detection ────────────────────────────────────────────────────────
+# Returns ISO 639-3 code
+detect_language() {
+  local subfile="$1" basename_hint="$2"
+
+  # 1. Try filename: match .en.srt, .fra.srt, .english.srt, etc.
+  local hint
+  hint=$(echo "$basename_hint" | grep -oE '\.(en|fr|de|es|it|pt|nl|pl|ru|ja|ko|zh|ar|sv|no|da|fi|cs|hu|ro|tr|he|hi|th|vi|id|uk|el|bg|hr|sk|lt|lv|et|sl|eng|fra|deu|spa|ita|por|nld|pol|rus|jpn|kor|zho|ara|swe|nor|dan|fin|ces|hun|ron|tur|heb|hin|tha|vie|ind|ukr|ell|bul|hrv|slk|lit|lav|est|slv)\.' | head -1 | tr -d '.')
+  if [[ -n "$hint" ]]; then
+    debug "Language from filename: $hint"
+    resolve_lang "$hint"
+    return
+  fi
+
+  # 2. Try langdetect on subtitle text content
+  if $HAS_LANGDETECT && [[ -f "$subfile" ]]; then
+    local detected
+    detected=$(python3 - "$subfile" << 'PYEOF'
+import sys, re
+try:
+    from langdetect import detect
+    with open(sys.argv[1], encoding='utf-8', errors='ignore') as f:
+        text = f.read()
+    # Strip SRT/ASS markup, numbers, timestamps
+    text = re.sub(r'\d+\n\d{2}:\d{2}:\d{2}.*?\n', '', text)
+    text = re.sub(r'\{[^}]+\}|<[^>]+>', '', text)
+    text = re.sub(r'\s+', ' ', text).strip()
+    if len(text) > 50:
+        print(detect(text))
+    else:
+        print('und')
+except Exception:
+    print('und')
+PYEOF
+    )
+    debug "Language from content: $detected"
+    resolve_lang "${detected:-und}"
+    return
+  fi
+
+  echo "und"
+}
+
+# ── ASS styling ───────────────────────────────────────────────────────────────
+# Returns path to a styled .ass file in tmpdir
+apply_ass_style() {
+  local subfile="$1" tmpdir="$2"
+  local ext="${subfile##*.}"; ext="${ext,,}"
+  local outfile="$tmpdir/$(basename "${subfile%.*}").ass"
+
+  case "$ext" in
+    srt)
+      debug "Converting SRT → ASS: $(basename "$subfile")"
+      python3 - "$subfile" "$outfile" << PYEOF
+import sys, re
+
+def srt_to_ass(srt_path, out_path):
+    with open(srt_path, encoding='utf-8', errors='ignore') as f:
+        content = f.read()
+
+    header = """${ASS_HEADER}"""
+
+    blocks = re.split(r'\n{2,}', content.strip())
+    events = []
+    for block in blocks:
+        lines = block.strip().splitlines()
+        if len(lines) < 3:
+            continue
+        m = re.match(r'(\d{2}:\d{2}:\d{2}[,\.]\d{3})\s*-->\s*(\d{2}:\d{2}:\d{2}[,\.]\d{3})', lines[1])
+        if not m:
+            continue
+        start = m.group(1).replace(',', '.')
+        end   = m.group(2).replace(',', '.')
+        text  = '\\n'.join(lines[2:])
+        # SRT → ASS inline tags
+        text = re.sub(r'<b>(.*?)</b>', r'{\\\\b1}\\1{\\\\b0}', text, flags=re.I|re.S)
+        text = re.sub(r'<i>(.*?)</i>', r'{\\\\i1}\\1{\\\\i0}', text, flags=re.I|re.S)
+        text = re.sub(r'<u>(.*?)</u>', r'{\\\\u1}\\1{\\\\u0}', text, flags=re.I|re.S)
+        text = re.sub(r'<[^>]+>', '', text)
+        text = text.replace('\\n', '\\\\N')
+        events.append(f"Dialogue: 0,{start},{end},Default,,0,0,0,,{text}")
+
+    with open(out_path, 'w', encoding='utf-8') as f:
+        f.write(header + '\n' + '\n'.join(events) + '\n')
+
+srt_to_ass(sys.argv[1], sys.argv[2])
+PYEOF
+      ;;
+
+    ass|ssa)
+      debug "Checking ASS styles: $(basename "$subfile")"
+      python3 - "$subfile" "$outfile" << PYEOF
+import sys, re
+
+ASS_STYLE = "${ASS_STYLE}"
+STYLE_FORMAT = "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding"
+
+GENERIC_FONTS = {'arial', 'helvetica', 'times new roman', 'verdana', 'default'}
+
+with open(sys.argv[1], encoding='utf-8', errors='ignore') as f:
+    content = f.read()
+
+# Find Default style line if present
+style_match = re.search(r'^(Style:\s*Default,.+)$', content, re.M)
+if style_match:
+    existing = style_match.group(1)
+    # Extract fontname (field 2)
+    parts = existing.split(',')
+    fontname = parts[1].strip().lower() if len(parts) > 1 else ''
+    if fontname in GENERIC_FONTS or fontname == '':
+        # Generic font — replace with Anime Ace 2
+        content = content.replace(existing, ASS_STYLE)
+        print('replaced', file=sys.stderr)
+    else:
+        print(f'kept ({fontname})', file=sys.stderr)
+else:
+    # No Default style — inject one
+    content = re.sub(
+        r'(Format:\s*Name, Fontname.*\n)',
+        f'\\1{ASS_STYLE}\n',
+        content
+    )
+    print('injected', file=sys.stderr)
+
+with open(sys.argv[2], 'w', encoding='utf-8') as f:
+    f.write(content)
+PYEOF
+      ;;
+
+    vtt|smi)
+      debug "Converting $ext → SRT → ASS: $(basename "$subfile")"
+      local srttmp="$tmpdir/$(basename "${subfile%.*}").srt"
+      ffmpeg -hide_banner -loglevel error -y -i "$subfile" "$srttmp" 2>/dev/null
+      # Recurse with SRT
+      apply_ass_style "$srttmp" "$tmpdir"
+      return
+      ;;
+
+    *)
+      warn "Unsupported subtitle format: .$ext — skipping styling"
+      cp "$subfile" "$outfile"
+      ;;
+  esac
+
+  echo "$outfile"
+}
+
+# ── Encoding fix ──────────────────────────────────────────────────────────────
+ensure_utf8() {
+  local f="$1" tmpdir="$2"
+  local out="$tmpdir/utf8_$(basename "$f")"
+  if command -v uchardet &>/dev/null; then
+    local enc; enc=$(uchardet "$f" 2>/dev/null | tr '[:lower:]' '[:upper:]')
+  else
+    local enc="UTF-8"
+  fi
+  [[ "$enc" == "UTF-8" || "$enc" == "UTF8" || -z "$enc" ]] && { echo "$f"; return; }
+  debug "Re-encoding $(basename "$f"): $enc → UTF-8"
+  iconv -f "$enc" -t "UTF-8//TRANSLIT" "$f" > "$out" 2>/dev/null && echo "$out" || echo "$f"
+}
+
+# ── Safe backup ───────────────────────────────────────────────────────────────
+backup_file() {
+  local f="$1" backup_dir="$2"
+  local rel="${f#$(pwd)/}"
+  local dest="$backup_dir/$rel"
+  mkdir -p "$(dirname "$dest")"
+  cp "$f" "$dest"
+  log_op "BACKUP" "$f" "$dest"
+  debug "Backed up: $rel"
+}
+
+# ── Process one video file ────────────────────────────────────────────────────
+process_video() {
+  local video="$1" backup_dir="$2"
+  local video_dir; video_dir="$(dirname "$video")"
+  local video_filename; video_filename="$(basename "$video")"
+  local video_base="${video_filename%.*}"
+  local tmpdir="$TMPDIR_BASE/$(echo "$video_base" | tr ' /' '__')"
+  mkdir -p "$tmpdir"
+
+  section "$video_filename"
+  rule
+
+  # ── Find external subtitle files ─────────────────────────────────────────
+  declare -a ext_subs=()
+  for ext in "${SUB_EXTS[@]}"; do
+    while IFS= read -r -d '' f; do
+      ext_subs+=("$f")
+    done < <(find "$video_dir" -maxdepth 1 -name "${video_base}*.${ext}" -print0 2>/dev/null | sort -z)
+  done
+
+  # ── Find embedded subtitle tracks ────────────────────────────────────────
+  local probe_json="$tmpdir/probe.json"
+  ffprobe -v quiet -print_format json -show_streams "$video" > "$probe_json" 2>/dev/null || true
+  declare -a emb_tracks=()  # "index:codec:lang:title"
+  while IFS= read -r line; do
+    emb_tracks+=("$line")
+  done < <(python3 - "$probe_json" << 'PYEOF'
+import json, sys
+try:
+    with open(sys.argv[1]) as f:
+        d = json.load(f)
+except Exception:
+    sys.exit(0)
+for s in d.get('streams', []):
+    if s.get('codec_type') != 'subtitle':
+        continue
+    idx   = s.get('index', '')
+    codec = s.get('codec_name', 'unknown')
+    tags  = s.get('tags', {})
+    lang  = tags.get('language', tags.get('LANGUAGE', 'und'))
+    title = tags.get('title', tags.get('TITLE', ''))
+    print(f"{idx}:{codec}:{lang}:{title}")
+PYEOF
+  )
+
+  local total_subs=$(( ${#ext_subs[@]} + ${#emb_tracks[@]} ))
+  if [[ $total_subs -eq 0 ]]; then
+    warn "No subtitles found — skipping"
+    ((SKIPPED++)) || true
+    return
+  fi
+
+  info "Found ${#ext_subs[@]} external + ${#emb_tracks[@]} embedded subtitle(s)"
+  $DRY_RUN && [[ ${#emb_tracks[@]} -gt 0 ]] &&     warn "Dry run: empty track detection and PGS OCR skipped — real run may produce fewer/different tracks"
+
+  # ── Extract embedded subtitles ────────────────────────────────────────────
+  # Phase 1: extract all tracks (serial — fast ffmpeg demux)
+  # Phase 2: OCR all PGS .sup files in parallel, then collect
+  # all_subs format: "filepath:iso3:original_title:kind"
+  declare -a all_subs=()
+  declare -a pgs_jobs=()  # "sup_file:iso3:orig_title:pid"
+
+  for track_info in "${emb_tracks[@]}"; do
+    IFS=':' read -r idx codec lang title <<< "$track_info"
+    local iso3; iso3=$(resolve_lang "$lang")
+    local orig_title="${title:-}"
+    local is_pgs=false
+    [[ "$codec" == "hdmv_pgs_subtitle" || "$codec" == "dvb_subtitle" ]] && is_pgs=true
+
+    if $is_pgs; then
+      local sup_file="$tmpdir/embedded_${idx}.sup"
+      debug "Extracting PGS track $idx ($lang) → .sup"
+      if $DRY_RUN || ffmpeg -hide_banner -loglevel error -y -i "$video"           -map "0:${idx}" -c:s copy "$sup_file" 2>/dev/null; then
+        if ! $DRY_RUN && [[ $(stat -c%s "$sup_file" 2>/dev/null || echo 0) -lt 512 ]]; then
+          debug "Skipping empty PGS track $idx"
+          rm -f "$sup_file"; continue
+        fi
+        if $HAS_PGSRIP && ! $DRY_RUN; then
+          # Launch OCR — cap parallel jobs to number of physical cores
+          local pgsrip_log="$tmpdir/pgsrip_${idx}.log"
+          local max_jobs; max_jobs=$(nproc 2>/dev/null || echo 4)
+          while [[ $(jobs -rp | wc -l) -ge $max_jobs ]]; do sleep 0.2; done
+          pgsrip "$sup_file" > "$pgsrip_log" 2>&1 &
+          pgs_jobs+=("$sup_file:$iso3:$orig_title:$!")
+          debug "OCR launched for track $idx (pid $!, $(jobs -rp | wc -l)/${max_jobs} slots used)"
+        elif $DRY_RUN; then
+          all_subs+=("/dev/null:$iso3:$orig_title:pgs")
+        else
+          all_subs+=("$sup_file:$iso3:$orig_title:pgs")
+        fi
+      else
+        warn "Failed to extract PGS track $idx"
+      fi
+    else
+      local out_ext="srt"
+      [[ "$codec" == "ass" || "$codec" == "ssa" ]] && out_ext="ass"
+      local extracted="$tmpdir/embedded_${idx}.${out_ext}"
+      debug "Extracting track $idx ($codec, $lang)"
+      if $DRY_RUN || ffmpeg -hide_banner -loglevel error -y -i "$video"           -map "0:${idx}" -c:s copy "$extracted" 2>/dev/null; then
+        if ! $DRY_RUN; then
+          local line_count
+          line_count=$(grep -cE "^[0-9]+$|^Dialogue:" "$extracted" 2>/dev/null || echo 0)
+          if [[ "$line_count" -eq 0 ]]; then
+            debug "Skipping empty subtitle track $idx"
+            rm -f "$extracted"; continue
+          fi
+        fi
+        $DRY_RUN && extracted="/dev/null"
+        all_subs+=("$extracted:$iso3:$orig_title:text")
+      else
+        warn "Failed to extract embedded track $idx"
+      fi
+    fi
+  done
+
+  # ── Wait for parallel PGS OCR jobs ───────────────────────────────────────
+  if [[ ${#pgs_jobs[@]} -gt 0 ]]; then
+    info "Waiting for ${#pgs_jobs[@]} PGS OCR job(s) to complete..."
+    for job_info in "${pgs_jobs[@]}"; do
+      IFS=':' read -r sup_file iso3 orig_title pid <<< "$job_info"
+      local ocr_srt="${sup_file%.sup}.srt"
+      local pgsrip_log="${sup_file%.sup}.log"
+      wait "$pid" 2>/dev/null || true
+      if [[ -s "$ocr_srt" ]]; then
+        all_subs+=("$ocr_srt:$iso3:$orig_title:pgs")
+        debug "PGS OCR OK → $(basename "$ocr_srt")"
+      else
+        warn "pgsrip OCR failed for $(basename "$sup_file") — keeping .sup"
+        if [[ -s "$pgsrip_log" ]]; then
+          while IFS= read -r pline; do
+            warn "  pgsrip: $pline"
+          done < "$pgsrip_log"
+        else
+          warn "  pgsrip: no output (check tesseract is installed: sudo dnf install tesseract)"
+        fi
+        all_subs+=("$sup_file:$iso3:$orig_title:pgs")
+      fi
+    done
+  fi
+
+  # ── Add external subtitles ────────────────────────────────────────────────
+  for sub in "${ext_subs[@]}"; do
+    local sub_base; sub_base="$(basename "$sub")"
+    local iso3; iso3=$(detect_language "$sub" "$sub_base")
+    all_subs+=("$sub:$iso3:$sub_base:text")
+    debug "External: $sub_base → $(lang_name "$iso3")"
+  done
+
+
+  # ── Deduplicate subtitle tracks ───────────────────────────────────────────
+  # For text tracks of the same language: if two tracks share ≥95% of lines,
+  # the later one is a duplicate — drop it. PGS/dry-run: skip (no content).
+  if ! $DRY_RUN && [[ ${#all_subs[@]} -gt 1 ]]; then
+    declare -a deduped_subs=()
+    for i in "${!all_subs[@]}"; do
+      IFS=':' read -r sub_i iso3_i orig_i kind_i <<< "${all_subs[$i]}"
+      if [[ "$kind_i" != "text" || ! -f "$sub_i" ]]; then
+        deduped_subs+=("${all_subs[$i]}")
+        continue
+      fi
+      local is_dup=false
+      for j in "${!deduped_subs[@]}"; do
+        IFS=':' read -r sub_j iso3_j orig_j kind_j <<< "${deduped_subs[$j]}"
+        [[ "$iso3_i" != "$iso3_j" || "$kind_j" != "text" || ! -f "$sub_j" ]] && continue
+        # Compare text content: strip markup/timestamps, count shared lines
+        local similarity
+        similarity=$(python3 - "$sub_j" "$sub_i" << 'PYEOF2'
+import sys, re
+
+def extract_lines(path):
+    with open(path, encoding="utf-8", errors="ignore") as f:
+        text = f.read()
+    # Strip timestamps, indices, ASS tags, HTML tags
+    text = re.sub(r"^\d+\s*$", "", text, flags=re.M)
+    text = re.sub(r"\d{2}:\d{2}:\d{2}[,.]\d{3}\s*-->\s*\d{2}:\d{2}:\d{2}[,.]\d{3}", "", text)
+    text = re.sub(r"Dialogue:.*?,\d+:\d+:\d+\.\d+,\d+:\d+:\d+\.\d+,[^,]*,[^,]*,\d+,\d+,\d+,[^,]*,", "", text)
+    text = re.sub(r"\{[^}]+\}|<[^>]+>", "", text)
+    lines = {l.strip() for l in text.splitlines() if l.strip()}
+    return lines
+
+a = extract_lines(sys.argv[1])
+b = extract_lines(sys.argv[2])
+if not a or not b:
+    print(0)
+else:
+    shared = len(a & b)
+    smaller = min(len(a), len(b))
+    print(round(shared / smaller * 100))
+PYEOF2
+        )
+        if [[ "${similarity:-0}" -ge 95 ]]; then
+          debug "Duplicate: $(basename "$sub_i") matches $(basename "$sub_j") (${similarity}% similar) — dropping"
+          warn "Dropped duplicate track ($iso3_i, ${similarity}% match with kept track)"
+          is_dup=true
+          break
+        fi
+      done
+      $is_dup || deduped_subs+=("${all_subs[$i]}")
+    done
+    local dropped=$(( ${#all_subs[@]} - ${#deduped_subs[@]} ))
+    [[ $dropped -gt 0 ]] && info "Removed $dropped duplicate track(s)"
+    all_subs=("${deduped_subs[@]}")
+  fi
+
+  # ── Style + sync each subtitle ────────────────────────────────────────────
+  declare -a mux_subs=()   # "filepath:iso3:orig_display:variant"
+  for i in "${!all_subs[@]}"; do
+    IFS=':' read -r sub iso3 orig_title kind <<< "${all_subs[$i]}"
+    local orig_display="${orig_title:-$(lang_name "$iso3")}"
+    local variant=""
+    local lower_title="${orig_title,,}"
+    if [[ "$lower_title" =~ sdh|hearing.impaired ]]; then variant="SDH"
+    elif [[ "$lower_title" =~ forced ]]; then variant="Forced"
+    elif [[ "$lower_title" =~ hi|commentary ]]; then variant="HI"
+    fi
+
+    # Ensure UTF-8 (text tracks only)
+    local utf8_sub="$sub"
+    [[ "$kind" == "text" && -f "$sub" ]] && utf8_sub=$(ensure_utf8 "$sub" "$tmpdir")
+
+    # Apply ASS styling (text tracks only, not raw .sup)
+    local styled_sub="$utf8_sub"
+    if [[ "$kind" == "text" ]]; then
+      if $DRY_RUN; then
+        styled_sub="$sub"
+      else
+        styled_sub=$(apply_ass_style "$utf8_sub" "$tmpdir" 2>/tmp/ass_style_msg || echo "$utf8_sub")
+        local style_msg; style_msg=$(cat /tmp/ass_style_msg 2>/dev/null || true)
+        [[ -n "$style_msg" ]] && debug "Style: $style_msg"
+      fi
+    fi
+
+    # Optional alass sync
+    if $SYNC && [[ -f "$styled_sub" && "$kind" == "text" ]]; then
+      local synced="$tmpdir/synced_$(basename "$styled_sub")"
+      debug "Syncing: $(lang_name "$iso3")"
+      if alass "$video" "$styled_sub" "$synced" 2>/dev/null && [[ -s "$synced" ]]; then
+        styled_sub="$synced"
+        debug "Sync applied"
+      else
+        debug "Sync skipped (alass found no improvement)"
+      fi
+    fi
+
+    # If lang still unknown, try content detection
+    if [[ "$iso3" == "und" && -f "$styled_sub" && "$kind" == "text" ]]; then
+      iso3=$(detect_language "$styled_sub" "")
+      lang_str=$(lang_name "$iso3")
+    fi
+
+    mux_subs+=("$styled_sub:$iso3:$orig_display:")
+  done
+
+  # ── Assign final labels now that we have the full kept set ────────────────
+  # Count plain (non-variant) tracks per language
+  declare -A plain_counts=()
+  for entry in "${mux_subs[@]}"; do
+    IFS=':' read -r _f _i _o variant_check <<< "$entry"
+    local lname; lname=$(lang_name "$_i")
+    if [[ -z "$variant_check" ]]; then
+      plain_counts["$lname"]=$(( ${plain_counts["$lname"]:-0} + 1 ))
+    fi
+  done
+
+  declare -A plain_seen=()
+  declare -a labeled_mux=()
+  for entry in "${mux_subs[@]}"; do
+    IFS=':' read -r subf iso3f orig_disp variant_f <<< "$entry"
+    local lname; lname=$(lang_name "$iso3f")
+    local final_label
+    if [[ -n "$variant_f" ]]; then
+      final_label="${lname} (${variant_f})"
+    elif [[ ${plain_counts["$lname"]:-0} -gt 1 ]]; then
+      plain_seen["$lname"]=$(( ${plain_seen["$lname"]:-0} + 1 ))
+      final_label="${lname} (${plain_seen[$lname]})"
+    else
+      final_label="$lname"
+    fi
+    info "${orig_disp:-(unnamed)} → ${final_label}"
+    labeled_mux+=("$subf:$iso3f:$final_label")
+  done
+  mux_subs=("${labeled_mux[@]}")
+
+  # ── Mux into MKV ─────────────────────────────────────────────────────────
+  local out_mkv="$tmpdir/${video_base}.mkv"
+  local final_mkv="$video_dir/${video_base}.mkv"
+
+  info "Muxing → $(basename "$final_mkv")"
+
+  if ! $DRY_RUN; then
+    local mkvmerge_args=("$video" "--no-subtitles")
+    local first_sub=true
+    for entry in "${mux_subs[@]}"; do
+      IFS=':' read -r subfile iso3 title <<< "$entry"
+      [[ ! -f "$subfile" ]] && continue
+      if $first_sub; then
+        mkvmerge_args+=(
+          "--language" "0:${iso3}"
+          "--track-name" "0:${title}"
+          "--default-track" "0:yes"
+          "$subfile"
+        )
+        first_sub=false
+      else
+        mkvmerge_args+=(
+          "--language" "0:${iso3}"
+          "--track-name" "0:${title}"
+          "--default-track" "0:no"
+          "$subfile"
+        )
+      fi
+    done
+
+    if ! mkvmerge -o "$out_mkv" "${mkvmerge_args[@]}" \
+        $( $VERBOSE || echo "--quiet" ) 2>&1 | { $VERBOSE && cat || grep -E "Error|Warning" || true; }; then
+      err "mkvmerge failed for: $video_filename"
+      ((FAILED++)) || true
+      FAILED_FILES+=("$video_filename")
+      return
+    fi
+
+    # Integrity check
+    if ! ffprobe -v error -i "$out_mkv" &>/dev/null; then
+      err "Output failed integrity check — original untouched"
+      rm -f "$out_mkv"
+      ((FAILED++)) || true
+      FAILED_FILES+=("$video_filename")
+      return
+    fi
+
+    # Backup originals
+    backup_file "$video" "$backup_dir"
+    for sub in "${ext_subs[@]}"; do backup_file "$sub" "$backup_dir"; done
+
+    # Place final output
+    mv "$out_mkv" "$final_mkv"
+    log_op "CREATED" "$final_mkv"
+
+    # Remove original if it was a different file
+    [[ "$(realpath "$video")" != "$(realpath "$final_mkv")" ]] && rm -f "$video"
+    for sub in "${ext_subs[@]}"; do
+      [[ -f "$sub" ]] && rm -f "$sub"
+    done
+  fi
+
+  ok "Done: $(basename "$final_mkv")"
+  ((DONE++)) || true
+}
+
+# ── Main ──────────────────────────────────────────────────────────────────────
+check_deps
+
+[[ ! -d "$TARGET_DIR" ]] && { err "Directory not found: $TARGET_DIR"; exit 1; }
+TARGET_DIR="$(realpath "$TARGET_DIR")"
+BACKUP_DIR="$TARGET_DIR/.sub-merge-backup"
+
+echo ""
+echo -e "${BOLD}sub-merge${R}"
+echo -e "  Directory : $TARGET_DIR"
+echo -e "  Sync      : $SYNC"
+echo -e "  Verbose   : $VERBOSE"
+echo -e "  Dry run   : $DRY_RUN"
+echo -e "  Log file  : $LOG_FILE"
+echo ""
+
+# Write log header
+{
+  echo "# sub-merge rollback log"
+  echo "# Run: $(date '+%Y-%m-%d %H:%M:%S')"
+  echo "# Dir: $TARGET_DIR"
+  echo "# Backup: $BACKUP_DIR"
+} > "$LOG_FILE"
+
+$DRY_RUN || mkdir -p "$BACKUP_DIR"
+
+# Build video list
+mapfile -t VIDEO_FILES < <(
+  find "$TARGET_DIR" -type f | sort | while IFS= read -r f; do
+    ext="${f##*.}"; ext="${ext,,}"
+    for ve in "${VIDEO_EXTS[@]}"; do
+      [[ "$ext" == "$ve" ]] && { echo "$f"; break; }
+    done
+  done
+)
+
+if [[ ${#VIDEO_FILES[@]} -eq 0 ]]; then
+  warn "No video files found in $TARGET_DIR"
+  exit 0
+fi
+
+echo -e "Found ${BOLD}${#VIDEO_FILES[@]}${R} video file(s)\n"
+TOTAL=${#VIDEO_FILES[@]}
+
+for video in "${VIDEO_FILES[@]}"; do
+  process_video "$video" "$BACKUP_DIR" || {
+    err "Unhandled error processing: $(basename "$video")"
+    ((FAILED++)) || true
+    FAILED_FILES+=("$(basename "$video")")
+  }
+done
+
+# ── Summary ───────────────────────────────────────────────────────────────────
+echo ""
+rule
+echo -e "${BOLD}Summary${R}"
+rule
+echo -e "  Total   : $TOTAL"
+echo -e "  ${GREEN}Done    : $DONE${R}"
+[[ $SKIPPED -gt 0 ]] && echo -e "  ${YELLOW}Skipped : $SKIPPED (no subtitles found)${R}"
+[[ $FAILED  -gt 0 ]] && {
+  echo -e "  ${RED}Failed  : $FAILED${R}"
+  for f in "${FAILED_FILES[@]}"; do echo -e "    ${DIM}$f${R}"; done
+}
+echo ""
+if ! $DRY_RUN; then
+  echo -e "  Rollback: ${DIM}sub-merge -r $LOG_FILE${R}"
+  echo -e "  Backups : ${DIM}$BACKUP_DIR${R}"
+fi
+echo ""

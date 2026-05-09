@@ -1,0 +1,8 @@
+#!/bin/sh
+mkdir -p temp
+for f in *.mkv; do
+  ffmpeg -err_detect ignore_err -i "$f" -c copy -fflags +genpts -avoid_negative_ts make_zero temp/"${f##*/}"
+  mv temp/"${f##*/}" "$f"
+done
+#rm -rf temp
+

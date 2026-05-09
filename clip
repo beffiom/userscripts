@@ -1,0 +1,5 @@
+#!/bin/sh
+id=$(cliphist list | rofi -dmenu | awk '{print $1}')
+selected=$(cliphist decode "$id")
+wl-copy "$selected"
+dunstify -u low "Selection Copied" "$selected"

@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+query="${*:-}"
+[ -n "$query" ] || {
+  echo "usage: $0 <search query>"
+  exit 1
+}
+
+selection="$(
+  yt-dlp \
+    --flat-playlist \
+    --print '%(uploader)s || %(title)s || %(webpage_url)s' \
+    "ytsearch20:${query}" |
+  fzf
+)"
+
+[ -n "$selection" ] || exit 0
+
+url="${selection##*$' || '}"
+yt-dlp -f 'bestvideo[height<=720]+bestaudio/best[height<=720]' --progress --write-auto-sub --embed-subs --sub-format srt --sleep-interval 2 --merge-output-format mkv --embed-metadata --embed-chapters --sponsorblock-remove Sponsor -o '[%(uploader)s] %(title)s' "$url"
