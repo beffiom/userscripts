@@ -29,7 +29,7 @@ select_mark() {
 }
 add_mark() {
     local selector="$1"
-    local category=$(awk -F '::' '{print $1}' files/marks.txt | uniq | $selector)
+    local category=$(awk -F '::' '{print $1}' $MARKS_FILE | uniq | $selector)
     [[ "$selector" == "$FUZZY" ]] && {
         echo "Enter URL: "
         read -r url
